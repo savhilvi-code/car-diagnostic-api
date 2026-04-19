@@ -53,10 +53,6 @@ def clean_text(text: str) -> str:
 
 
 def extract_real_url(link: str) -> str:
-    """
-    DuckDuckGo sometimes returns redirect links like /l/?uddg=...
-    This function extracts the real URL if needed.
-    """
     if not link:
         return ""
 
@@ -73,7 +69,18 @@ def extract_real_url(link: str) -> str:
     return link
 
 
-def ddg_search(query: str, max_results: int = 5):
+def domain_matches(url: str, domain: str) -> bool:
+    if not url or not domain:
+        return False
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        return domain in host
+    except Exception:
+        return False
+
+
+def ddg_search(query: str, max_results: int = 10):
     url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
@@ -99,30 +106,126 @@ def ddg_search(query: str, max_results: int = 5):
     return results
 
 
+def search_for_forum(query: str, forum: str, domain: str, lang: str):
+    """
+    Strategy:
+    1. Soft search by original query
+    2. Filter by forum domain
+    3. If empty, fallback search with 'forum' / 'форум'
+    4. If still empty, fallback with site:domain
+    """
+    debug = {
+        "forum": forum,
+        "domain": domain,
+        "query_original": query,
+        "attempts": [],
+    }
+
+    all_found = []
+
+    # Attempt 1: soft search
+    q1 = query
+    try:
+        raw1 = ddg_search(q1, max_results=10)
+        filtered1 = [x for x in raw1 if domain_matches(x["url"], domain)]
+        debug["attempts"].append({
+            "query": q1,
+            "raw_found": len(raw1),
+            "filtered_found": len(filtered1),
+            "mode": "soft",
+        })
+        all_found.extend(filtered1)
+    except Exception as e:
+        debug["attempts"].append({
+            "query": q1,
+            "raw_found": 0,
+            "filtered_found": 0,
+            "mode": "soft",
+            "error": str(e),
+        })
+
+    # Attempt 2: forum keyword
+    if not all_found:
+        forum_word = "форум" if lang == "ru" else "forum"
+        q2 = f"{query} {forum_word}"
+        try:
+            raw2 = ddg_search(q2, max_results=10)
+            filtered2 = [x for x in raw2 if domain_matches(x["url"], domain)]
+            debug["attempts"].append({
+                "query": q2,
+                "raw_found": len(raw2),
+                "filtered_found": len(filtered2),
+                "mode": "forum_keyword",
+            })
+            all_found.extend(filtered2)
+        except Exception as e:
+            debug["attempts"].append({
+                "query": q2,
+                "raw_found": 0,
+                "filtered_found": 0,
+                "mode": "forum_keyword",
+                "error": str(e),
+            })
+
+    # Attempt 3: strict site search
+    if not all_found:
+        q3 = f"site:{domain} {query}"
+        try:
+            raw3 = ddg_search(q3, max_results=10)
+            filtered3 = [x for x in raw3 if domain_matches(x["url"], domain)]
+            debug["attempts"].append({
+                "query": q3,
+                "raw_found": len(raw3),
+                "filtered_found": len(filtered3),
+                "mode": "strict_site",
+            })
+            all_found.extend(filtered3)
+        except Exception as e:
+            debug["attempts"].append({
+                "query": q3,
+                "raw_found": 0,
+                "filtered_found": 0,
+                "mode": "strict_site",
+                "error": str(e),
+            })
+
+    # Remove duplicates by URL
+    dedup = []
+    seen = set()
+    for item in all_found:
+        url = item.get("url", "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        dedup.append(item)
+
+    return dedup[:5], debug
+
+
 def fetch_soup(url: str):
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
 
-def first_nonempty_text(soup: BeautifulSoup, selectors: List[str]) -> str:
+def first_nonempty_text(soup: BeautifulSoup, selectors: List[str], min_len: int = 50) -> str:
     for sel in selectors:
         el = soup.select_one(sel)
         if el:
             text = clean_text(el.get_text(" ", strip=True))
-            if len(text) > 50:
+            if len(text) >= min_len:
                 return text
     return ""
 
 
-def many_texts(soup: BeautifulSoup, selectors: List[str], limit: int = 10) -> List[str]:
+def many_texts(soup: BeautifulSoup, selectors: List[str], limit: int = 10, min_len: int = 25) -> List[str]:
     items = []
     seen = set()
 
     for sel in selectors:
         for el in soup.select(sel):
             text = clean_text(el.get_text(" ", strip=True))
-            if len(text) < 25:
+            if len(text) < min_len:
                 continue
             if text in seen:
                 continue
@@ -137,9 +240,7 @@ def many_texts(soup: BeautifulSoup, selectors: List[str], limit: int = 10) -> Li
 def parse_drive2_page(url: str):
     soup = fetch_soup(url)
 
-    title = ""
-    if soup.title:
-        title = clean_text(soup.title.get_text(" ", strip=True))
+    title = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
 
     post = first_nonempty_text(soup, [
         "article",
@@ -166,7 +267,7 @@ def parse_drive2_page(url: str):
             ".content",
             "#content",
             "body",
-        ])
+        ], min_len=100)
 
     return {
         "title_from_page": title,
@@ -178,9 +279,7 @@ def parse_drive2_page(url: str):
 def parse_drom_page(url: str):
     soup = fetch_soup(url)
 
-    title = ""
-    if soup.title:
-        title = clean_text(soup.title.get_text(" ", strip=True))
+    title = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
 
     post = first_nonempty_text(soup, [
         ".message-content",
@@ -200,7 +299,6 @@ def parse_drom_page(url: str):
         ".b-post__content",
     ], limit=10)
 
-    # very often first item = main post, rest = replies
     if comments and post and comments[0] == post:
         comments = comments[1:]
 
@@ -214,7 +312,38 @@ def parse_drom_page(url: str):
             ".content",
             "#content",
             "body",
-        ])
+        ], min_len=100)
+
+    return {
+        "title_from_page": title,
+        "post": post[:5000],
+        "comments": [c[:1500] for c in comments[:8]],
+    }
+
+
+def parse_auto_ru_page(url: str):
+    soup = fetch_soup(url)
+
+    title = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
+
+    post = first_nonempty_text(soup, [
+        ".messageText",
+        ".message-content",
+        ".post-message",
+        ".topic__text",
+        ".forum-message",
+        "article",
+    ])
+
+    comments = many_texts(soup, [
+        ".messageText",
+        ".message-content",
+        ".post-message",
+        ".forum-message",
+    ], limit=10)
+
+    if comments and post and comments[0] == post:
+        comments = comments[1:]
 
     return {
         "title_from_page": title,
@@ -226,9 +355,7 @@ def parse_drom_page(url: str):
 def parse_generic_page(url: str):
     soup = fetch_soup(url)
 
-    title = ""
-    if soup.title:
-        title = clean_text(soup.title.get_text(" ", strip=True))
+    title = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
 
     post = first_nonempty_text(soup, [
         "article",
@@ -239,13 +366,13 @@ def parse_generic_page(url: str):
         ".message",
         ".entry-content",
         "body",
-    ])
+    ], min_len=100)
 
     comments = many_texts(soup, [
         '[class*="comment"]',
         '[class*="reply"]',
         '[class*="message"]',
-    ], limit=8)
+    ], limit=8, min_len=40)
 
     if comments and post and comments[0] == post:
         comments = comments[1:]
@@ -261,10 +388,11 @@ def parse_forum_page(url: str, forum: str):
     try:
         if forum == "drive2":
             return parse_drive2_page(url)
-        elif forum == "drom":
+        if forum == "drom":
             return parse_drom_page(url)
-        else:
-            return parse_generic_page(url)
+        if forum == "auto_ru":
+            return parse_auto_ru_page(url)
+        return parse_generic_page(url)
     except Exception as e:
         return {
             "title_from_page": "",
@@ -277,48 +405,55 @@ def parse_forum_page(url: str, forum: str):
 @app.post("/search")
 def search(data: SearchRequest):
     all_results = []
+    debug_forums = []
 
     for forum in data.forums:
         domain = FORUM_DOMAIN_MAP.get(forum)
         if not domain:
+            debug_forums.append({
+                "forum": forum,
+                "domain": "",
+                "skipped": True,
+                "reason": "unknown_forum",
+            })
             continue
 
-        search_query = f"site:{domain} {data.query}"
-
         try:
-            found = ddg_search(search_query, max_results=3)
+            found_links, debug_info = search_for_forum(
+                query=data.query,
+                forum=forum,
+                domain=domain,
+                lang=data.lang,
+            )
+            debug_forums.append(debug_info)
 
-            for item in found:
+            for item in found_links:
                 page_data = parse_forum_page(item["url"], forum)
 
                 all_results.append({
                     "forum": forum,
                     "domain": domain,
-                    "search_query": search_query,
-                    "title": item["title"],
-                    "url": item["url"],
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "title_from_page": page_data.get("title_from_page", ""),
                     "post": page_data.get("post", ""),
                     "comments": page_data.get("comments", []),
-                    "title_from_page": page_data.get("title_from_page", ""),
                     "parse_error": page_data.get("parse_error", ""),
                 })
 
         except Exception as e:
-            all_results.append({
+            debug_forums.append({
                 "forum": forum,
                 "domain": domain,
-                "search_query": search_query,
-                "title": f"Search error: {str(e)}",
-                "url": "",
-                "post": "",
-                "comments": [],
-                "title_from_page": "",
-                "parse_error": str(e),
+                "query_original": data.query,
+                "fatal_error": str(e),
             })
 
     return {
         "query": data.query,
         "lang": data.lang,
+        "forums_requested": data.forums,
         "results_count": len(all_results),
+        "debug_forums": debug_forums,
         "results": all_results,
     }
