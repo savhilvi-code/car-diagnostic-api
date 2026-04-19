@@ -1,10 +1,14 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from urllib.parse import quote, urlparse, parse_qs, unquote
 import re
+import random
+import time
 
 app = FastAPI()
 
@@ -30,19 +34,82 @@ FORUM_DOMAIN_MAP: Dict[str, str] = {
     "pcauto": "pcauto.com.cn",
 }
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ru,en-US;q=0.9,en;q=0.8",
-}
+
+USER_AGENTS = [
+    # Chrome Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+
+    # Chrome Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+
+    # Chrome Linux
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+
+    # Edge Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+
+    # Safari Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+
+    # Mobile Safari iPhone
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 "
+    "Mobile/15E148 Safari/604.1",
+
+    # Mobile Chrome Android
+    "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+]
 
 
 @app.get("/")
 def home():
     return {"message": "Car Diagnostic API is working"}
+
+
+def build_session() -> requests.Session:
+    session = requests.Session()
+
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        backoff_factor=0.7,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+SESSION = build_session()
+
+
+def get_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept-Language": "ru,en-US;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://duckduckgo.com/",
+        "DNT": "1",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+
+def human_delay(min_s: float = 0.35, max_s: float = 1.1) -> None:
+    time.sleep(random.uniform(min_s, max_s))
 
 
 def clean_text(text: str) -> str:
@@ -72,17 +139,86 @@ def extract_real_url(link: str) -> str:
 def domain_matches(url: str, domain: str) -> bool:
     if not url or not domain:
         return False
+
     try:
-        parsed = urlparse(url)
-        host = parsed.netloc.lower()
+        host = urlparse(url).netloc.lower()
         return domain in host
     except Exception:
         return False
 
 
-def ddg_search(query: str, max_results: int = 10):
+def dedupe_results(items: List[Dict]) -> List[Dict]:
+    out = []
+    seen = set()
+
+    for item in items:
+        url = item.get("url", "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(item)
+
+    return out
+
+
+def simplify_query(query: str, lang: str) -> List[str]:
+    q = clean_text(query)
+    variants = [q]
+
+    stop_ru = [
+        "проблема", "проблемы", "с", "на", "и", "или", "при", "машина", "авто",
+        "холодным", "холодную", "запуском", "пуском", "причины", "года", "год",
+        "двигателем", "двигатель"
+    ]
+    stop_en = [
+        "problem", "issue", "with", "for", "and", "cold", "start", "starting",
+        "engine", "year", "model"
+    ]
+
+    tokens = q.split()
+
+    if lang == "ru":
+        short_tokens = [t for t in tokens if t.lower() not in stop_ru]
+    elif lang == "en":
+        short_tokens = [t for t in tokens if t.lower() not in stop_en]
+    else:
+        short_tokens = tokens
+
+    short_q = clean_text(" ".join(short_tokens))
+    if short_q and short_q not in variants:
+        variants.append(short_q)
+
+    keep_keywords = []
+    for t in short_tokens:
+        low = t.lower()
+        if (
+            "nissan" in low
+            or "x-trail" in low
+            or "xtrail" in low
+            or "pnt30" in low
+            or "sr20ve" in low
+            or "sr20vet" in low
+            or "завод" in low
+            or "пуск" in low
+            or "холод" in low
+            or "гуд" in low
+            or "cold" in low
+            or "start" in low
+            or "noise" in low
+        ):
+            keep_keywords.append(t)
+
+    mini_q = clean_text(" ".join(keep_keywords))
+    if mini_q and mini_q not in variants:
+        variants.append(mini_q)
+
+    return variants[:3]
+
+
+def ddg_html_search(query: str, max_results: int = 10) -> List[Dict]:
+    human_delay()
     url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
-    r = requests.get(url, headers=HEADERS, timeout=20)
+    r = SESSION.get(url, headers=get_headers(), timeout=8)
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
@@ -98,6 +234,7 @@ def ddg_search(query: str, max_results: int = 10):
         results.append({
             "title": title,
             "url": link,
+            "source": "ddg_html",
         })
 
         if len(results) >= max_results:
@@ -106,14 +243,106 @@ def ddg_search(query: str, max_results: int = 10):
     return results
 
 
+def ddg_lite_search(query: str, max_results: int = 10) -> List[Dict]:
+    human_delay()
+    url = f"https://lite.duckduckgo.com/lite/?q={quote(query)}"
+    r = SESSION.get(url, headers=get_headers(), timeout=8)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
+
+    for a in soup.select("a"):
+        href = a.get("href", "")
+        text = clean_text(a.get_text(" ", strip=True))
+
+        if not href or not text:
+            continue
+
+        real_url = extract_real_url(href)
+        if not real_url.startswith("http"):
+            continue
+
+        results.append({
+            "title": text,
+            "url": real_url,
+            "source": "ddg_lite",
+        })
+
+        if len(results) >= max_results:
+            break
+
+    return results
+
+
+def search_engine(query: str, max_results: int = 10) -> Tuple[List[Dict], List[Dict]]:
+    debug = []
+    all_found = []
+
+    try:
+        r1 = ddg_html_search(query, max_results=max_results)
+        debug.append({
+            "engine": "ddg_html",
+            "query": query,
+            "found": len(r1),
+        })
+        all_found.extend(r1)
+    except Exception as e:
+        debug.append({
+            "engine": "ddg_html",
+            "query": query,
+            "found": 0,
+            "error": str(e),
+        })
+
+    if not all_found:
+        try:
+            r2 = ddg_lite_search(query, max_results=max_results)
+            debug.append({
+                "engine": "ddg_lite",
+                "query": query,
+                "found": len(r2),
+            })
+            all_found.extend(r2)
+        except Exception as e:
+            debug.append({
+                "engine": "ddg_lite",
+                "query": query,
+                "found": 0,
+                "error": str(e),
+            })
+
+    return dedupe_results(all_found), debug
+
+
+def build_query_variants(query: str, lang: str, domain: str) -> List[Tuple[str, str]]:
+    variants = []
+    simplified = simplify_query(query, lang)
+
+    for q in simplified:
+        variants.append(("soft", q))
+
+    forum_word = "форум" if lang == "ru" else "forum"
+    for q in simplified[:2]:
+        variants.append(("forum_keyword", f"{q} {forum_word}"))
+
+    for q in simplified[:2]:
+        variants.append(("strict_site", f"site:{domain} {q}"))
+
+    out = []
+    seen = set()
+
+    for mode, q in variants:
+        q = clean_text(q)
+        if not q or q in seen:
+            continue
+        seen.add(q)
+        out.append((mode, q))
+
+    return out[:6]
+
+
 def search_for_forum(query: str, forum: str, domain: str, lang: str):
-    """
-    Strategy:
-    1. Soft search by original query
-    2. Filter by forum domain
-    3. If empty, fallback search with 'forum' / 'форум'
-    4. If still empty, fallback with site:domain
-    """
     debug = {
         "forum": forum,
         "domain": domain,
@@ -121,94 +350,36 @@ def search_for_forum(query: str, forum: str, domain: str, lang: str):
         "attempts": [],
     }
 
-    all_found = []
+    collected = []
 
-    # Attempt 1: soft search
-    q1 = query
-    try:
-        raw1 = ddg_search(q1, max_results=10)
-        filtered1 = [x for x in raw1 if domain_matches(x["url"], domain)]
+    for mode, q in build_query_variants(query, lang, domain):
+        found, engine_debug = search_engine(q, max_results=10)
+        filtered = [x for x in found if domain_matches(x["url"], domain)]
+
         debug["attempts"].append({
-            "query": q1,
-            "raw_found": len(raw1),
-            "filtered_found": len(filtered1),
-            "mode": "soft",
-        })
-        all_found.extend(filtered1)
-    except Exception as e:
-        debug["attempts"].append({
-            "query": q1,
-            "raw_found": 0,
-            "filtered_found": 0,
-            "mode": "soft",
-            "error": str(e),
+            "mode": mode,
+            "query": q,
+            "raw_found": len(found),
+            "filtered_found": len(filtered),
+            "engines": engine_debug,
         })
 
-    # Attempt 2: forum keyword
-    if not all_found:
-        forum_word = "форум" if lang == "ru" else "forum"
-        q2 = f"{query} {forum_word}"
-        try:
-            raw2 = ddg_search(q2, max_results=10)
-            filtered2 = [x for x in raw2 if domain_matches(x["url"], domain)]
-            debug["attempts"].append({
-                "query": q2,
-                "raw_found": len(raw2),
-                "filtered_found": len(filtered2),
-                "mode": "forum_keyword",
-            })
-            all_found.extend(filtered2)
-        except Exception as e:
-            debug["attempts"].append({
-                "query": q2,
-                "raw_found": 0,
-                "filtered_found": 0,
-                "mode": "forum_keyword",
-                "error": str(e),
-            })
+        collected.extend(filtered)
 
-    # Attempt 3: strict site search
-    if not all_found:
-        q3 = f"site:{domain} {query}"
-        try:
-            raw3 = ddg_search(q3, max_results=10)
-            filtered3 = [x for x in raw3 if domain_matches(x["url"], domain)]
-            debug["attempts"].append({
-                "query": q3,
-                "raw_found": len(raw3),
-                "filtered_found": len(filtered3),
-                "mode": "strict_site",
-            })
-            all_found.extend(filtered3)
-        except Exception as e:
-            debug["attempts"].append({
-                "query": q3,
-                "raw_found": 0,
-                "filtered_found": 0,
-                "mode": "strict_site",
-                "error": str(e),
-            })
+        if filtered:
+            break
 
-    # Remove duplicates by URL
-    dedup = []
-    seen = set()
-    for item in all_found:
-        url = item.get("url", "")
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        dedup.append(item)
-
-    return dedup[:5], debug
+    return dedupe_results(collected)[:5], debug
 
 
 def fetch_soup(url: str):
-    r = requests.get(url, headers=HEADERS, timeout=20)
+    human_delay(0.4, 1.3)
+    r = SESSION.get(url, headers=get_headers(), timeout=8)
     r.raise_for_status()
     return BeautifulSoup(r.text, "html.parser")
 
 
-def first_nonempty_text(soup: BeautifulSoup, selectors: List[str], min_len: int = 50) -> str:
+def first_nonempty_text(soup: BeautifulSoup, selectors: List[str], min_len: int = 60) -> str:
     for sel in selectors:
         el = soup.select_one(sel)
         if el:
@@ -218,7 +389,7 @@ def first_nonempty_text(soup: BeautifulSoup, selectors: List[str], min_len: int 
     return ""
 
 
-def many_texts(soup: BeautifulSoup, selectors: List[str], limit: int = 10, min_len: int = 25) -> List[str]:
+def many_texts(soup: BeautifulSoup, selectors: List[str], limit: int = 8, min_len: int = 30) -> List[str]:
     items = []
     seen = set()
 
@@ -250,7 +421,7 @@ def parse_drive2_page(url: str):
         ".post-content",
         ".js-content",
         '[class*="content"]',
-    ])
+    ], min_len=80)
 
     comments = many_texts(soup, [
         ".c-comment__body",
@@ -259,7 +430,7 @@ def parse_drive2_page(url: str):
         ".comment__body",
         '[class*="comment"] [class*="text"]',
         '[class*="comment"] [class*="body"]',
-    ], limit=8)
+    ], limit=8, min_len=40)
 
     if not post:
         post = first_nonempty_text(soup, [
@@ -267,12 +438,12 @@ def parse_drive2_page(url: str):
             ".content",
             "#content",
             "body",
-        ], min_len=100)
+        ], min_len=150)
 
     return {
         "title_from_page": title,
         "post": post[:5000],
-        "comments": [c[:1500] for c in comments],
+        "comments": [c[:1200] for c in comments],
     }
 
 
@@ -289,7 +460,7 @@ def parse_drom_page(url: str):
         ".messageBody",
         ".topic-body",
         "article",
-    ])
+    ], min_len=80)
 
     comments = many_texts(soup, [
         ".message-content",
@@ -297,7 +468,7 @@ def parse_drom_page(url: str):
         ".post_message",
         ".messageBody",
         ".b-post__content",
-    ], limit=10)
+    ], limit=10, min_len=40)
 
     if comments and post and comments[0] == post:
         comments = comments[1:]
@@ -312,12 +483,12 @@ def parse_drom_page(url: str):
             ".content",
             "#content",
             "body",
-        ], min_len=100)
+        ], min_len=150)
 
     return {
         "title_from_page": title,
         "post": post[:5000],
-        "comments": [c[:1500] for c in comments[:8]],
+        "comments": [c[:1200] for c in comments[:8]],
     }
 
 
@@ -333,14 +504,14 @@ def parse_auto_ru_page(url: str):
         ".topic__text",
         ".forum-message",
         "article",
-    ])
+    ], min_len=80)
 
     comments = many_texts(soup, [
         ".messageText",
         ".message-content",
         ".post-message",
         ".forum-message",
-    ], limit=10)
+    ], limit=10, min_len=40)
 
     if comments and post and comments[0] == post:
         comments = comments[1:]
@@ -348,7 +519,7 @@ def parse_auto_ru_page(url: str):
     return {
         "title_from_page": title,
         "post": post[:5000],
-        "comments": [c[:1500] for c in comments[:8]],
+        "comments": [c[:1200] for c in comments[:8]],
     }
 
 
@@ -366,13 +537,13 @@ def parse_generic_page(url: str):
         ".message",
         ".entry-content",
         "body",
-    ], min_len=100)
+    ], min_len=150)
 
     comments = many_texts(soup, [
         '[class*="comment"]',
         '[class*="reply"]',
         '[class*="message"]',
-    ], limit=8, min_len=40)
+    ], limit=8, min_len=60)
 
     if comments and post and comments[0] == post:
         comments = comments[1:]
@@ -380,7 +551,7 @@ def parse_generic_page(url: str):
     return {
         "title_from_page": title,
         "post": post[:5000],
-        "comments": [c[:1500] for c in comments],
+        "comments": [c[:1200] for c in comments],
     }
 
 
@@ -435,6 +606,7 @@ def search(data: SearchRequest):
                     "domain": domain,
                     "title": item.get("title", ""),
                     "url": item.get("url", ""),
+                    "search_source": item.get("source", ""),
                     "title_from_page": page_data.get("title_from_page", ""),
                     "post": page_data.get("post", ""),
                     "comments": page_data.get("comments", []),
